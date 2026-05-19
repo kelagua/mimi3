@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 import os
 
-from .db import kv_get, kv_put
+from .db import kv_get, kv_put, users_init
 
 # 引入 Manager 长驻协程任务
 from .manager import start_manager_tasks, trigger_rebuild
@@ -90,6 +90,7 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 正在拉起挂后台的 Claw 账号守护线程...")
 
     await asyncio.to_thread(init_metrics_db)
+    await asyncio.to_thread(users_init)
     fixed = await asyncio.to_thread(reclassify_history)
     if fixed:
         logger.info(f"🔧 重新分类了 {fixed} 条历史状态记录")
