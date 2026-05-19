@@ -27,7 +27,7 @@ if __name__ == "__main__":
     import os
     from logging.handlers import RotatingFileHandler
 
-    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    log_dir = "/tmp/logs"
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "gateway.log")
 
