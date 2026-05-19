@@ -22,7 +22,7 @@ from .gateway_state import state
 router = APIRouter()
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-USERS_DIR = os.path.join(ROOT_DIR, "users")
+USERS_DIR = os.getenv("MIMO_USERS_DIR", os.path.join(ROOT_DIR, "users"))
 
 
 @router.get("/")
