@@ -11,7 +11,7 @@ import psycopg2.pool
 
 logger = logging.getLogger(__name__)
 
-_DSN = os.getenv("DATABASE_URL")
+_DSN = os.getenv("DATABASE_URL", "")
 
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
@@ -21,7 +21,12 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     if _pool is None:
         if not _DSN:
             raise RuntimeError("DATABASE_URL 环境变量未配置，无法连接 PostgreSQL")
-        _pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=5, dsn=_DSN)
+        # 确保 connect_timeout 存在（秒），防止连接无限挂起
+        dsn = _DSN
+        if "connect_timeout" not in dsn:
+            sep = "&" if "?" in dsn else "?"
+            dsn = f"{dsn}{sep}connect_timeout=10"
+        _pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=5, dsn=dsn)
         logger.info("🐘 PostgreSQL 连接池已初始化")
     return _pool
 

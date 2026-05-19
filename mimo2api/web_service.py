@@ -84,21 +84,42 @@ async def sweep_stale_queues():
         except Exception as e:
             logger.error(f"清理死锁队列任务发生异常: {e}")
 
+async def _init_and_start_backgrounds():
+    """在后台完成数据库初始化和启动后台任务，不阻塞 HTTP 启动。"""
+    global manager_bg_task, metrics_persist_task, sweeper_bg_task
+
+    for attempt in range(1, 31):
+        try:
+            await asyncio.to_thread(init_metrics_db)
+            await asyncio.to_thread(users_init)
+            break
+        except Exception as e:
+            logger.warning(f"⚠️ 数据库连接失败（第 {attempt} 次）: {e}，5 秒后重试...")
+            await asyncio.sleep(5)
+    else:
+        logger.error("❌ 数据库初始化连续失败 30 次，放弃启动后台任务")
+        return
+
+    try:
+        fixed = await asyncio.to_thread(reclassify_history)
+        if fixed:
+            logger.info(f"🔧 重新分类了 {fixed} 条历史状态记录")
+    except Exception as e:
+        logger.warning(f"⚠️ 重分类历史数据失败（非致命）: {e}")
+
+    manager_bg_task = asyncio.create_task(start_manager_tasks())
+    metrics_persist_task = asyncio.create_task(metrics_history_worker())
+    sweeper_bg_task = asyncio.create_task(sweep_stale_queues())
+    logger.info("✅ 后台任务全部启动完成")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global manager_bg_task, metrics_persist_task, sweeper_bg_task
     logger.info("🚀 正在拉起挂后台的 Claw 账号守护线程...")
 
-    await asyncio.to_thread(init_metrics_db)
-    await asyncio.to_thread(users_init)
-    fixed = await asyncio.to_thread(reclassify_history)
-    if fixed:
-        logger.info(f"🔧 重新分类了 {fixed} 条历史状态记录")
-
-    manager_bg_task = asyncio.create_task(start_manager_tasks())
-    metrics_persist_task = asyncio.create_task(metrics_history_worker())
-    sweeper_bg_task = asyncio.create_task(sweep_stale_queues())
-
+    # 不阻塞：yield 之后再初始化数据库和启动后台任务
+    asyncio.create_task(_init_and_start_backgrounds())
     yield
 
     for task in [manager_bg_task, metrics_persist_task, sweeper_bg_task]:
