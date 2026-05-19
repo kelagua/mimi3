@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import sqlite3
 import time
 from collections import deque
 from typing import Any
@@ -9,13 +8,11 @@ from typing import Any
 from fastapi import WebSocket
 
 from .gateway_state import state
+from .db import get_conn, kv_get, kv_put, kv_init
 
 METRICS_BUCKET_SECONDS = max(60, int(os.getenv("MIMO_METRICS_BUCKET_SECONDS", "1800")))
 METRICS_RETENTION_DAYS = max(1, int(os.getenv("MIMO_METRICS_RETENTION_DAYS", "90")))
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-METRICS_DB_PATH = os.getenv("MIMO_METRICS_DB_PATH", os.path.join(ROOT_DIR, "gateway_metrics.db"))
-METRICS_SNAPSHOT_PATH = os.getenv("MIMO_METRICS_SNAPSHOT_PATH", os.path.join(ROOT_DIR, "gateway_snapshot.json"))
-METRICS_SNAPSHOT_INTERVAL = 60  # 每 60 秒保存一次
+KV_SNAPSHOT_KEY = "metrics_cumulative_snapshot"
 
 
 def node_label(ws: WebSocket) -> str:
@@ -318,93 +315,75 @@ def build_history_rows(bucket_start: int, current_snapshot: dict[str, Any], prev
     return rows
 
 
+# ─── PostgreSQL 存储 ───
+
 def init_metrics_db() -> None:
-    conn = sqlite3.connect(METRICS_DB_PATH, timeout=30)
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS status_history (
-                component_type TEXT NOT NULL,
-                component_key TEXT NOT NULL,
-                bucket_start INTEGER NOT NULL,
-                requests_total INTEGER NOT NULL,
-                requests_succeeded INTEGER NOT NULL,
-                requests_failed INTEGER NOT NULL,
-                success_rate REAL NOT NULL,
-                avg_latency_ms REAL NOT NULL,
-                status TEXT NOT NULL,
-                PRIMARY KEY (component_type, component_key, bucket_start)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_status_history_bucket
-            ON status_history (bucket_start)
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    kv_init()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS status_history (
+                    component_type TEXT NOT NULL,
+                    component_key  TEXT NOT NULL,
+                    bucket_start   BIGINT NOT NULL,
+                    requests_total     INTEGER NOT NULL,
+                    requests_succeeded INTEGER NOT NULL,
+                    requests_failed    INTEGER NOT NULL,
+                    success_rate       DOUBLE PRECISION NOT NULL,
+                    avg_latency_ms     DOUBLE PRECISION NOT NULL,
+                    status             TEXT NOT NULL,
+                    PRIMARY KEY (component_type, component_key, bucket_start)
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_status_history_bucket
+                ON status_history (bucket_start)
+            """)
 
 
 def write_history_rows(rows: list[tuple[Any, ...]]) -> None:
     if not rows:
         return
-    conn = sqlite3.connect(METRICS_DB_PATH, timeout=30)
-    try:
-        conn.executemany(
-            """
-            INSERT INTO status_history (
-                component_type,
-                component_key,
-                bucket_start,
-                requests_total,
-                requests_succeeded,
-                requests_failed,
-                success_rate,
-                avg_latency_ms,
-                status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(component_type, component_key, bucket_start) DO UPDATE SET
-                requests_total = excluded.requests_total,
-                requests_succeeded = excluded.requests_succeeded,
-                requests_failed = excluded.requests_failed,
-                success_rate = excluded.success_rate,
-                avg_latency_ms = excluded.avg_latency_ms,
-                status = excluded.status
-            """,
-            rows,
-        )
-        retention_cutoff = int(time.time()) - METRICS_RETENTION_DAYS * 86400
-        conn.execute("DELETE FROM status_history WHERE bucket_start < ?", (retention_cutoff,))
-        conn.commit()
-    finally:
-        conn.close()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for row in rows:
+                cur.execute(
+                    """
+                    INSERT INTO status_history
+                        (component_type, component_key, bucket_start,
+                         requests_total, requests_succeeded, requests_failed,
+                         success_rate, avg_latency_ms, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (component_type, component_key, bucket_start) DO UPDATE SET
+                        requests_total     = EXCLUDED.requests_total,
+                        requests_succeeded = EXCLUDED.requests_succeeded,
+                        requests_failed    = EXCLUDED.requests_failed,
+                        success_rate       = EXCLUDED.success_rate,
+                        avg_latency_ms     = EXCLUDED.avg_latency_ms,
+                        status             = EXCLUDED.status
+                    """,
+                    row,
+                )
+            retention_cutoff = int(time.time()) - METRICS_RETENTION_DAYS * 86400
+            cur.execute("DELETE FROM status_history WHERE bucket_start < %s", (retention_cutoff,))
 
 
 def reclassify_history() -> int:
-    """重新分类历史数据中的 status 字段（一次性迁移）"""
-    conn = sqlite3.connect(METRICS_DB_PATH, timeout=30)
-    try:
-        cur = conn.execute(
-            "UPDATE status_history SET status = CASE "
-            "WHEN requests_total <= 0 THEN 'no_data' "
-            "WHEN success_rate >= 95 THEN 'operational' "
-            "WHEN success_rate >= 85 THEN 'degraded' "
-            "ELSE 'major_outage' END "
-            "WHERE status != CASE "
-            "WHEN requests_total <= 0 THEN 'no_data' "
-            "WHEN success_rate >= 95 THEN 'operational' "
-            "WHEN success_rate >= 85 THEN 'degraded' "
-            "ELSE 'major_outage' END"
-        )
-        conn.commit()
-        return cur.rowcount
-    finally:
-        conn.close()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE status_history SET status = CASE "
+                "WHEN requests_total <= 0 THEN 'no_data' "
+                "WHEN success_rate >= 95 THEN 'operational' "
+                "WHEN success_rate >= 85 THEN 'degraded' "
+                "ELSE 'major_outage' END "
+                "WHERE status != CASE "
+                "WHEN requests_total <= 0 THEN 'no_data' "
+                "WHEN success_rate >= 95 THEN 'operational' "
+                "WHEN success_rate >= 85 THEN 'degraded' "
+                "ELSE 'major_outage' END"
+            )
+            return cur.rowcount
 
 
 async def flush_history_bucket(bucket_start: int) -> None:
@@ -415,10 +394,9 @@ async def flush_history_bucket(bucket_start: int) -> None:
 
 
 async def metrics_history_worker() -> None:
-    # 启动时加载历史累积指标
     if load_cumulative_metrics():
         import logging
-        logging.getLogger(__name__).info("📊 已从快照恢复累积指标")
+        logging.getLogger(__name__).info("📊 已从 PostgreSQL 快照恢复累积指标")
     state.metrics_history_last_snapshot = capture_metrics_snapshot()
     last_save = time.time()
     try:
@@ -427,8 +405,7 @@ async def metrics_history_worker() -> None:
             next_bucket_start = (int(now) // METRICS_BUCKET_SECONDS + 1) * METRICS_BUCKET_SECONDS
             await asyncio.sleep(max(1, next_bucket_start - now))
             await flush_history_bucket(next_bucket_start - METRICS_BUCKET_SECONDS)
-            # 定期保存累积指标
-            if time.time() - last_save >= METRICS_SNAPSHOT_INTERVAL:
+            if time.time() - last_save >= 60:
                 await asyncio.to_thread(save_cumulative_metrics)
                 last_save = time.time()
     except asyncio.CancelledError:
@@ -444,29 +421,28 @@ def load_status_history(hours: int) -> dict[str, Any]:
     latest_complete_bucket = max(0, (now // METRICS_BUCKET_SECONDS) * METRICS_BUCKET_SECONDS - METRICS_BUCKET_SECONDS)
     start_bucket = max(0, latest_complete_bucket - bucket_span + METRICS_BUCKET_SECONDS)
     since_ts = start_bucket
-    conn = sqlite3.connect(METRICS_DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            """
-            SELECT
-                component_type,
-                component_key,
-                bucket_start,
-                requests_total,
-                requests_succeeded,
-                requests_failed,
-                success_rate,
-                avg_latency_ms,
-                status
-            FROM status_history
-            WHERE bucket_start >= ?
-            ORDER BY component_type, component_key, bucket_start
-            """,
-            (since_ts,),
-        ).fetchall()
-    finally:
-        conn.close()
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    component_type,
+                    component_key,
+                    bucket_start,
+                    requests_total,
+                    requests_succeeded,
+                    requests_failed,
+                    success_rate,
+                    avg_latency_ms,
+                    status
+                FROM status_history
+                WHERE bucket_start >= %s
+                ORDER BY component_type, component_key, bucket_start
+                """,
+                (since_ts,),
+            )
+            raw_rows = cur.fetchall()
 
     components: dict[tuple[str, str], dict[str, Any]] = {}
     default_component_keys = [("gateway", "gateway")] + [("route", route_key) for route_key in sorted(state.metrics["routes"])]
@@ -483,22 +459,23 @@ def load_status_history(hours: int) -> dict[str, Any]:
             },
         }
 
-    for row in rows:
-        key = (row["component_type"], row["component_key"])
-        component = components.setdefault(key, {"component_type": row["component_type"], "component_key": row["component_key"], "display_name": "Gateway" if row["component_type"] == "gateway" else row["component_key"], "points": [], "totals": {"requests_total": 0, "requests_succeeded": 0, "requests_failed": 0}})
+    for row in raw_rows:
+        ct, ck, bs, rt, rs, rf, sr, al, st = row
+        key = (ct, ck)
+        component = components.setdefault(key, {"component_type": ct, "component_key": ck, "display_name": "Gateway" if ct == "gateway" else ck, "points": [], "totals": {"requests_total": 0, "requests_succeeded": 0, "requests_failed": 0}})
         component["points"].append({
-            "bucket_start": row["bucket_start"],
-            "bucket_end": row["bucket_start"] + METRICS_BUCKET_SECONDS,
-            "status": row["status"],
-            "requests_total": row["requests_total"],
-            "requests_succeeded": row["requests_succeeded"],
-            "requests_failed": row["requests_failed"],
-            "success_rate": round(float(row["success_rate"]), 2),
-            "avg_latency_ms": round(float(row["avg_latency_ms"]), 2),
+            "bucket_start": bs,
+            "bucket_end": bs + METRICS_BUCKET_SECONDS,
+            "status": st,
+            "requests_total": rt,
+            "requests_succeeded": rs,
+            "requests_failed": rf,
+            "success_rate": round(float(sr), 2),
+            "avg_latency_ms": round(float(al), 2),
         })
-        component["totals"]["requests_total"] += int(row["requests_total"])
-        component["totals"]["requests_succeeded"] += int(row["requests_succeeded"])
-        component["totals"]["requests_failed"] += int(row["requests_failed"])
+        component["totals"]["requests_total"] += int(rt)
+        component["totals"]["requests_succeeded"] += int(rs)
+        component["totals"]["requests_failed"] += int(rf)
 
     history_components = []
     bucket_starts = list(range(start_bucket, latest_complete_bucket + 1, METRICS_BUCKET_SECONDS)) if latest_complete_bucket >= start_bucket else []
@@ -641,10 +618,9 @@ def build_gateway_stats(background_tasks_count: int) -> dict[str, Any]:
     }
 
 
-# ─── 累积指标持久化 ───
+# ─── 累积指标持久化（存 PostgreSQL kv_store） ───
 
 def save_cumulative_metrics() -> None:
-    """将当前累积指标保存到 JSON 文件"""
     m = state.metrics
     data = {
         "saved_at": time.time(),
@@ -689,23 +665,15 @@ def save_cumulative_metrics() -> None:
             "first_byte_latency_sum_ms": float(nv["first_byte_latency_sum_ms"]),
             "status_codes": dict(nv["status_codes"]),
         }
-    tmp = METRICS_SNAPSHOT_PATH + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, METRICS_SNAPSHOT_PATH)
+        kv_put(KV_SNAPSHOT_KEY, data)
     except Exception:
         pass
 
 
 def load_cumulative_metrics() -> bool:
-    """从 JSON 文件恢复累积指标，返回是否成功加载"""
-    if not os.path.exists(METRICS_SNAPSHOT_PATH):
-        return False
-    try:
-        with open(METRICS_SNAPSHOT_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
+    data = kv_get(KV_SNAPSHOT_KEY)
+    if data is None:
         return False
 
     m = state.metrics

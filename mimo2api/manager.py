@@ -39,27 +39,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(name)s] - %(lev
 logger = logging.getLogger("Manager")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_URL = "https://aistudio.xiaomimimo.com"
 WS_URL = "wss://aistudio.xiaomimimo.com/ws/proxy"
 
-# ----------------- 用户加载逻辑 (遵循 web_core.py 原版逻辑) -----------------
+# ----------------- 用户加载逻辑 (PostgreSQL) -----------------
 def load_all_users() -> dict:
-    """从 users/ 目录读取所有用户的登录凭证"""
-    users = {}
-    ud = os.path.join(ROOT_DIR, "users")
-    if os.path.exists(ud):
-        for fn in os.listdir(ud):
-            if fn.startswith("user_") and fn.endswith(".json"):
-                try:
-                    with open(os.path.join(ud, fn), "r", encoding="utf-8") as f:
-                        udata = json.load(f)
-                        uid = udata.get("userId")
-                        if uid:
-                            users[str(uid).strip()] = udata
-                except Exception:
-                    continue
-    return users
+    """从 PostgreSQL users 表读取所有用户的登录凭证"""
+    from .db import users_load_all
+    return users_load_all()
 
 
 async def get_bridge_code() -> str:

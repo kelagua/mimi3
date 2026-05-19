@@ -6,25 +6,14 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, TextIO
+from typing import Any
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 import os
-from pathlib import Path
 
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
-
-try:
-    import msvcrt
-except ImportError:
-    msvcrt = None
-
-MODEL_MAPPING_FILE = Path(__file__).parent.parent / "model_mapping.json"
+from .db import kv_get, kv_put
 
 # 引入 Manager 长驻协程任务
 from .manager import start_manager_tasks, trigger_rebuild
@@ -70,7 +59,6 @@ logger = logging.getLogger(__name__)
 manager_bg_task = None
 metrics_persist_task = None
 sweeper_bg_task = None
-single_process_lock_file = None
 STALE_QUEUE_TTL = 300
 
 def sweep_stale_queues_once(now: float | None = None) -> int:
@@ -100,19 +88,18 @@ async def sweep_stale_queues():
 async def lifespan(app: FastAPI):
     global manager_bg_task, metrics_persist_task, sweeper_bg_task
     logger.info("🚀 正在拉起挂后台的 Claw 账号守护线程...")
-    acquire_single_process_lock()
 
     await asyncio.to_thread(init_metrics_db)
     fixed = await asyncio.to_thread(reclassify_history)
     if fixed:
         logger.info(f"🔧 重新分类了 {fixed} 条历史状态记录")
-        
+
     manager_bg_task = asyncio.create_task(start_manager_tasks())
     metrics_persist_task = asyncio.create_task(metrics_history_worker())
-    sweeper_bg_task = asyncio.create_task(sweep_stale_queues()) # 启动巡检死神
-    
+    sweeper_bg_task = asyncio.create_task(sweep_stale_queues())
+
     yield
-    
+
     for task in [manager_bg_task, metrics_persist_task, sweeper_bg_task]:
         if task:
             task.cancel()
@@ -121,7 +108,6 @@ async def lifespan(app: FastAPI):
             await metrics_persist_task
         except asyncio.CancelledError:
             pass
-    release_single_process_lock()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -205,75 +191,13 @@ STREAM_KEEPALIVE_INTERVAL = 25  # 秒，需小于 Cloudflare 超时 (~100s)
 QUEUE_DRAIN_TIMEOUT = 5
 DEFAULT_GATEWAY_ERROR = "Gateway Error: 所有节点请求失败"
 NODE_401_COOLDOWN_SECONDS = int(os.getenv("MIMO_NODE_401_COOLDOWN_SECONDS", "900"))
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROCESS_LOCK_PATH = os.getenv("MIMO_PROCESS_LOCK_PATH", os.path.join(ROOT_DIR, "mimo2api.lock"))
 
 # 后台 fire-and-forget 任务集合
 _background_tasks: set[asyncio.Task] = set()
-PROCESS_LOCK_SIZE = 1
 
 def _track_task(task: asyncio.Task) -> None:
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
-
-def _lock_file_nonblocking(lock_file: TextIO) -> None:
-    if os.name == "nt":
-        if msvcrt is None:
-            raise OSError("当前平台缺少 msvcrt，无法加锁。")
-        lock_file.seek(0)
-        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, PROCESS_LOCK_SIZE)
-        return
-
-    if fcntl is None:
-        raise OSError("当前平台缺少 fcntl，无法加锁。")
-    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-def _unlock_file(lock_file: TextIO) -> None:
-    if os.name == "nt":
-        if msvcrt is None:
-            raise OSError("当前平台缺少 msvcrt，无法解锁。")
-        lock_file.seek(0)
-        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, PROCESS_LOCK_SIZE)
-        return
-
-    if fcntl is None:
-        raise OSError("当前平台缺少 fcntl，无法解锁。")
-    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-def acquire_single_process_lock() -> None:
-    global single_process_lock_file
-    if single_process_lock_file is not None:
-        return
-
-    try:
-        lock_path = Path(PROCESS_LOCK_PATH)
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path.touch(exist_ok=True)
-        lock_file = lock_path.open("r+", encoding="utf-8")
-        if lock_path.stat().st_size < PROCESS_LOCK_SIZE:
-            lock_file.write("\n")
-            lock_file.flush()
-        _lock_file_nonblocking(lock_file)
-    except (BlockingIOError, OSError) as exc:
-        if 'lock_file' in locals():
-            lock_file.close()
-        raise RuntimeError("当前进程锁被占用。") from exc
-
-    lock_file.seek(0)
-    lock_file.truncate()
-    lock_file.write(str(os.getpid()))
-    lock_file.flush()
-    single_process_lock_file = lock_file
-
-def release_single_process_lock() -> None:
-    global single_process_lock_file
-    if single_process_lock_file is None:
-        return
-    try:
-        _unlock_file(single_process_lock_file)
-    finally:
-        single_process_lock_file.close()
-        single_process_lock_file = None
 
 @dataclass(slots=True)
 class RetryState:
@@ -309,18 +233,14 @@ async def api_errors(limit: int = 50):
     errors.reverse()  # 最新的在前
     return JSONResponse(content={"count": len(errors), "errors": errors})
 
+KV_MODEL_MAPPING_KEY = "model_mapping"
+
 def load_model_mapping() -> dict[str, str]:
-    if not MODEL_MAPPING_FILE.exists():
-        return {}
-    try:
-        return json.loads(MODEL_MAPPING_FILE.read_text("utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
+    data = kv_get(KV_MODEL_MAPPING_KEY)
+    return data if isinstance(data, dict) else {}
 
 def save_model_mapping(mapping: dict[str, str]) -> None:
-    tmp = MODEL_MAPPING_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), "utf-8")
-    tmp.rename(MODEL_MAPPING_FILE)
+    kv_put(KV_MODEL_MAPPING_KEY, mapping)
 
 def apply_model_mapping(body_text: str) -> str:
     mapping = load_model_mapping()
