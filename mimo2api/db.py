@@ -107,30 +107,47 @@ def users_load_all() -> dict[str, dict]:
 
 
 def users_add(uid: str, service_token: str, xiaomichatbot_ph: str, name: str, raw_data: dict) -> None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO users (user_id, service_token, xiaomichatbot_ph, name, raw_data) "
-                "VALUES (%s, %s, %s, %s, %s::jsonb) "
-                "ON CONFLICT (user_id) DO UPDATE SET "
-                "service_token = EXCLUDED.service_token, "
-                "xiaomichatbot_ph = EXCLUDED.xiaomichatbot_ph, "
-                "name = EXCLUDED.name, "
-                "raw_data = EXCLUDED.raw_data",
-                (uid, service_token, xiaomichatbot_ph, name, json.dumps(raw_data, ensure_ascii=False)),
-            )
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (user_id, service_token, xiaomichatbot_ph, name, raw_data) "
+                    "VALUES (%s, %s, %s, %s, %s::jsonb) "
+                    "ON CONFLICT (user_id) DO UPDATE SET "
+                    "service_token = EXCLUDED.service_token, "
+                    "xiaomichatbot_ph = EXCLUDED.xiaomichatbot_ph, "
+                    "name = EXCLUDED.name, "
+                    "raw_data = EXCLUDED.raw_data",
+                    (uid, service_token, xiaomichatbot_ph, name, json.dumps(raw_data, ensure_ascii=False)),
+                )
+    except Exception as e:
+        if "does not exist" in str(e):
+            users_init()
+            users_add(uid, service_token, xiaomichatbot_ph, name, raw_data)
+        else:
+            raise
 
 
 def users_delete(uid: str) -> bool:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM users WHERE user_id = %s", (uid,))
-            return cur.rowcount > 0
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM users WHERE user_id = %s", (uid,))
+                return cur.rowcount > 0
+    except Exception as e:
+        if "does not exist" in str(e):
+            return False
+        raise
 
 
 def users_list_raw() -> list[dict]:
     """返回所有用户 raw_data 列表（供 UI 接口使用）"""
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT raw_data FROM users")
-            return [dict(row["raw_data"]) for row in cur.fetchall()]
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT raw_data FROM users")
+                return [dict(row["raw_data"]) for row in cur.fetchall()]
+    except Exception as e:
+        if "does not exist" in str(e):
+            return []
+        raise

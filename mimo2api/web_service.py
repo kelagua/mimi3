@@ -88,17 +88,25 @@ async def _init_and_start_backgrounds():
     """在后台完成数据库初始化和启动后台任务，不阻塞 HTTP 启动。"""
     global manager_bg_task, metrics_persist_task, sweeper_bg_task
 
+    # ---- 阶段一：等待数据库连接就绪 ----
     for attempt in range(1, 31):
         try:
             await asyncio.to_thread(init_metrics_db)
-            await asyncio.to_thread(users_init)
+            logger.info("✅ status_history / kv_store 表就绪")
             break
         except Exception as e:
             logger.warning(f"⚠️ 数据库连接失败（第 {attempt} 次）: {e}，5 秒后重试...")
             await asyncio.sleep(5)
     else:
-        logger.error("❌ 数据库初始化连续失败 30 次，放弃启动后台任务")
+        logger.error("❌ 数据库连接连续失败 30 次，放弃启动后台任务")
         return
+
+    # ---- 阶段二：单独创建 users 表（即使失败也不阻塞其他功能） ----
+    try:
+        await asyncio.to_thread(users_init)
+        logger.info("✅ users 表就绪")
+    except Exception as e:
+        logger.error(f"❌ users 表创建失败: {e}")
 
     try:
         fixed = await asyncio.to_thread(reclassify_history)
@@ -107,6 +115,7 @@ async def _init_and_start_backgrounds():
     except Exception as e:
         logger.warning(f"⚠️ 重分类历史数据失败（非致命）: {e}")
 
+    # ---- 阶段三：启动后台守护任务 ----
     manager_bg_task = asyncio.create_task(start_manager_tasks())
     metrics_persist_task = asyncio.create_task(metrics_history_worker())
     sweeper_bg_task = asyncio.create_task(sweep_stale_queues())
